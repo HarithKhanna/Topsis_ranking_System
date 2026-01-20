@@ -1,90 +1,79 @@
-import sys
-import os
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 
-def error_exit(msg: str):
-    print(f"Error: {msg}")
-    sys.exit(1)
+class TopsisError(Exception):
+    pass
 
 
-def parse_list(arg: str, name: str):
-    if "," not in arg:
-        error_exit(f"{name} must be separated by ',' (comma). Example: 1,1,2")
-    parts = [x.strip() for x in arg.split(",") if x.strip() != ""]
-    if len(parts) == 0:
-        error_exit(f"{name} cannot be empty.")
-    return parts
-
-
-def validate_inputs(input_file, weights_str, impacts_str, output_file):
-    if not os.path.exists(input_file):
-        error_exit(f"File not found: {input_file}")
-
+def validate_and_load(input_file: str, weights: str, impacts: str):
     try:
         df = pd.read_csv(input_file)
+    except FileNotFoundError:
+        raise TopsisError(f"File not found: {input_file}")
     except Exception as e:
-        error_exit(f"Unable to read input file. Ensure it's a valid CSV. Details: {e}")
+        raise TopsisError(f"Could not read file. Ensure it is a CSV. Details: {e}")
 
     if df.shape[1] < 3:
-        error_exit("Input file must contain three or more columns (1 name/id column + >=2 criteria columns).")
+        raise TopsisError("Input file must contain at least 3 columns.")
 
     criteria_cols = df.columns[1:]
-    criteria = df[criteria_cols].copy()
 
     for col in criteria_cols:
-        criteria[col] = pd.to_numeric(criteria[col], errors="coerce")
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if df[criteria_cols].isna().any().any():
+        bad_cols = df[criteria_cols].columns[df[criteria_cols].isna().any()].tolist()
+        raise TopsisError(f"Non-numeric value(s) found in criteria columns: {bad_cols}")
 
-    if criteria.isna().any().any():
-        bad_cols = criteria.columns[criteria.isna().any()].tolist()
-        error_exit(f"Non-numeric value(s) found in criteria columns: {bad_cols}")
+    if "," not in weights:
+        raise TopsisError("Weights must be comma separated. Example: 1,1,2")
+    if "," not in impacts:
+        raise TopsisError("Impacts must be comma separated. Example: +,+,-")
 
-    weights = parse_list(weights_str, "Weights")
-    impacts = parse_list(impacts_str, "Impacts")
+    w = [x.strip() for x in weights.split(",") if x.strip()]
+    im = [x.strip() for x in impacts.split(",") if x.strip()]
 
-    n_criteria = len(criteria_cols)
-    if len(weights) != n_criteria:
-        error_exit(f"Number of weights ({len(weights)}) must match number of criteria columns ({n_criteria}).")
-    if len(impacts) != n_criteria:
-        error_exit(f"Number of impacts ({len(impacts)}) must match number of criteria columns ({n_criteria}).")
+    if len(w) != len(criteria_cols):
+        raise TopsisError("Number of weights must match number of criteria columns.")
+    if len(im) != len(criteria_cols):
+        raise TopsisError("Number of impacts must match number of criteria columns.")
 
     try:
-        weights = [float(w) for w in weights]
+        w = np.array([float(x) for x in w], dtype=float)
     except:
-        error_exit("Weights must be numeric values separated by commas. Example: 1,1,2")
+        raise TopsisError("Weights must be numeric.")
 
-    if any(w <= 0 for w in weights):
-        error_exit("Weights must be positive numbers.")
+    if np.any(w <= 0):
+        raise TopsisError("Weights must be positive.")
 
-    impacts = [imp.strip() for imp in impacts]
-    for imp in impacts:
-        if imp not in ["+", "-"]:
-            error_exit("Impacts must be either '+' or '-' separated by commas. Example: +,+,-,+")
+    for x in im:
+        if x not in ["+", "-"]:
+            raise TopsisError("Impacts must be '+' or '-' only.")
 
-    return df, criteria_cols, np.array(weights, dtype=float), impacts
+    return df, criteria_cols, w, im
 
 
-def topsis(df, criteria_cols, weights, impacts):
-    X = df[criteria_cols].astype(float).values
+def run_topsis(df, criteria_cols, weights, impacts):
+    X = df[criteria_cols].values.astype(float)
+
     denom = np.sqrt((X ** 2).sum(axis=0))
     if np.any(denom == 0):
-        error_exit("One or more criteria columns have all zero values, cannot normalize.")
+        raise TopsisError("Some criteria column has all zeros; cannot normalize.")
     R = X / denom
 
-    W = weights / weights.sum()
-    V = R * W
+    weights = weights / weights.sum()
+    V = R * weights
 
     ideal_best = np.zeros(V.shape[1])
     ideal_worst = np.zeros(V.shape[1])
 
     for j in range(V.shape[1]):
         if impacts[j] == "+":
-            ideal_best[j] = V[:, j].max()
-            ideal_worst[j] = V[:, j].min()
+            ideal_best[j] = np.max(V[:, j])
+            ideal_worst[j] = np.min(V[:, j])
         else:
-            ideal_best[j] = V[:, j].min()
-            ideal_worst[j] = V[:, j].max()
+            ideal_best[j] = np.min(V[:, j])
+            ideal_worst[j] = np.max(V[:, j])
 
     S_plus = np.sqrt(((V - ideal_best) ** 2).sum(axis=1))
     S_minus = np.sqrt(((V - ideal_worst) ** 2).sum(axis=1))
@@ -92,35 +81,7 @@ def topsis(df, criteria_cols, weights, impacts):
     score = S_minus / (S_plus + S_minus)
     rank = score.argsort()[::-1].argsort() + 1
 
-    return score, rank
-
-
-def main():
-    if len(sys.argv) != 5:
-        print("Usage:")
-        print("  python topsis.py <InputDataFile> <Weights> <Impacts> <OutputResultFileName>")
-        print("Example:")
-        print('  python topsis.py data.csv "1,1,1,2" "+,+,-,+" output-result.csv')
-        sys.exit(1)
-
-    input_file = sys.argv[1]
-    weights_str = sys.argv[2]
-    impacts_str = sys.argv[3]
-    output_file = sys.argv[4]
-
-    df, criteria_cols, weights, impacts = validate_inputs(input_file, weights_str, impacts_str, output_file)
-    score, rank = topsis(df, criteria_cols, weights, impacts)
-
     df["Topsis Score"] = np.round(score, 6)
     df["Rank"] = rank
 
-    try:
-        df.to_csv(output_file, index=False)
-    except Exception as e:
-        error_exit(f"Failed to write output file. Details: {e}")
-
-    print(f"Success: TOPSIS result saved to '{output_file}'")
-
-
-if __name__ == "__main__":
-    main()
+    return df
